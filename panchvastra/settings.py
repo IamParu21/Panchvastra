@@ -228,6 +228,13 @@ CORS_ALLOW_HEADERS = [
     "x-requested-with",
 ]
 
+# Lets the frontend read X-Auth-Token-Status ("expired" / "invalid"), set
+# when a public endpoint served a request as a guest because the sent token
+# was unusable — the cue to clear or refresh the stored token.
+CORS_EXPOSE_HEADERS = [
+    "X-Auth-Token-Status",
+]
+
 
 SWAGGER_HOST = os.getenv('SWAGGER_HOST')
 
@@ -238,15 +245,17 @@ REST_FRAMEWORK = {
 
     # Auth/identity is enforced by the custom `user_authentication_required`
     # decorator (JWT-based), not DRF's auth/permission system, so DRF's own
-    # `request.user` is never populated (always anonymous) — UserRateThrottle
-    # would silently degrade to the same IP-keyed behavior as AnonRateThrottle.
-    # This is IP-keyed defense-in-depth against brute force/flooding on
-    # login/register/OTP endpoints, not the access-control layer itself.
+    # `request.user` is never populated (always anonymous) and DRF's
+    # UserRateThrottle would key everyone by IP. JWTUserOrIPRateThrottle keys
+    # a caller with a valid token by user id ("user" rate) and guests by IP
+    # ("anon" rate), so customers sharing one IP don't share one limit.
+    # Login/register/OTP/help-desk views keep their own scoped throttles.
     'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
+        'helpers.throttling.JWTUserOrIPRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '30/minute',
+        'anon': os.getenv('THROTTLE_ANON_RATE', '120/minute'),
+        'user': os.getenv('THROTTLE_USER_RATE', '240/minute'),
         'otp': '5/minute',
         'google_login': '10/minute',
         'support_query': '5/minute',
@@ -325,6 +334,12 @@ RUSTFS_ACCESS_KEY = os.getenv("RUSTFS_ACCESS_KEY")
 RUSTFS_SECRET_KEY = os.getenv("RUSTFS_SECRET_KEY")
 RUSTFS_BUCKET_NAME = os.getenv("RUSTFS_BUCKET_NAME", "panchvastra")
 RUSTFS_PUBLIC_URL_BASE = os.getenv("RUSTFS_PUBLIC_URL_BASE")
+# Public S3 API address of RustFS (scheme + host[:port], no bucket), used
+# only to sign direct browser upload URLs for product videos. Needed when
+# RUSTFS_ENDPOINT_URL is an internal address browsers can't reach; falls
+# back to RUSTFS_ENDPOINT_URL when unset. The bucket must also allow CORS
+# PUT from the admin panel origin.
+RUSTFS_PRESIGN_ENDPOINT_URL = os.getenv("RUSTFS_PRESIGN_ENDPOINT_URL")
 # RustFS doesn't use AWS regions, but boto3's SigV4 signer still requires
 # some region string to be set (there's no env var/~/.aws/config on the
 # server to fall back on) or every request fails with NoRegionError — the

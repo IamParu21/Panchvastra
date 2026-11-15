@@ -3,6 +3,10 @@ from rest_framework import serializers
 
 class CreateCategorySerializer(serializers.Serializer):
     name = serializers.CharField(max_length=255)
+    slug = serializers.CharField(
+        max_length=150, required=False, allow_blank=True,
+        help_text="URL slug. Omit to generate it from the name. Normalized to lowercase-with-hyphens."
+    )
     description = serializers.CharField(required=False, allow_blank=True)
     image = serializers.ImageField(required=False)
     is_active = serializers.BooleanField(required=False, default=True)
@@ -12,6 +16,10 @@ class CreateCategorySerializer(serializers.Serializer):
 class UpdateCategorySerializer(serializers.Serializer):
     id = serializers.IntegerField()
     name = serializers.CharField(max_length=255, required=False)
+    slug = serializers.CharField(
+        max_length=150, required=False, allow_blank=True,
+        help_text="URL slug. Omit to generate it from the name. Normalized to lowercase-with-hyphens."
+    )
     description = serializers.CharField(required=False, allow_blank=True)
     image = serializers.ImageField(required=False)
     display_order = serializers.IntegerField(required=False, min_value=0)
@@ -33,6 +41,10 @@ class UpdateAuthCarouselImageSerializer(serializers.Serializer):
 class CreateSubCategorySerializer(serializers.Serializer):
     category_id = serializers.IntegerField()
     name = serializers.CharField(max_length=255)
+    slug = serializers.CharField(
+        max_length=150, required=False, allow_blank=True,
+        help_text="URL slug. Omit to generate it from the name. Normalized to lowercase-with-hyphens."
+    )
     is_active = serializers.BooleanField(required=False, default=True)
     display_order = serializers.IntegerField(required=False, allow_null=True, min_value=0)
 
@@ -41,6 +53,10 @@ class UpdateSubCategorySerializer(serializers.Serializer):
     id = serializers.IntegerField()
     category_id = serializers.IntegerField(required=False)
     name = serializers.CharField(max_length=255, required=False)
+    slug = serializers.CharField(
+        max_length=150, required=False, allow_blank=True,
+        help_text="URL slug. Omit to generate it from the name. Normalized to lowercase-with-hyphens."
+    )
     is_active = serializers.BooleanField(required=False)
     display_order = serializers.IntegerField(required=False, min_value=0)
     
@@ -217,6 +233,11 @@ class KeyHighlightSerializer(serializers.Serializer):
 class CreateProductSerializer(serializers.Serializer):
 
     category_id = serializers.IntegerField()
+
+    slug = serializers.CharField(
+        max_length=150, required=False, allow_blank=True,
+        help_text="URL slug. Omit to generate it from the name. Normalized to lowercase-with-hyphens."
+    )
 
     sub_category_id = serializers.IntegerField(
         required=False,

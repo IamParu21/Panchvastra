@@ -8,6 +8,12 @@ from rest_framework import status
 
 from helpers.utils import decode_jwt_token
 
+
+# Set on a public-endpoint response that was served as a guest because the
+# sent token was unusable: "expired" or "invalid". Exposed via CORS
+# (CORS_EXPOSE_HEADERS) so the frontend can read it and clear the token.
+AUTH_TOKEN_STATUS_HEADER = "X-Auth-Token-Status"
+
 def user_authentication_required(role_required=None, public_methods=None):
     """
     JWT Authentication decorator.
@@ -35,14 +41,27 @@ def user_authentication_required(role_required=None, public_methods=None):
         def _wrapped_view(request, *args, **kwargs):
 
             auth_header = request.headers.get("Authorization")
+            is_public = request.method in public_methods
+
+            def _serve_anonymously(token_status=None):
+                request.user_id = None
+                request.role_id = None
+                request.jwt_payload = None
+                response = view_func(request, *args, **kwargs)
+
+                # A public endpoint must not fail just because the browser
+                # still holds a stale token (e.g. a product page opened after
+                # the session expired). It is served as a guest instead, and
+                # this header tells the frontend to drop/refresh the token.
+                if token_status:
+                    response[AUTH_TOKEN_STATUS_HEADER] = token_status
+
+                return response
 
             if not auth_header:
 
-                if request.method in public_methods:
-                    request.user_id = None
-                    request.role_id = None
-                    request.jwt_payload = None
-                    return view_func(request, *args, **kwargs)
+                if is_public:
+                    return _serve_anonymously()
 
                 return JsonResponse(
                     {
@@ -60,6 +79,9 @@ def user_authentication_required(role_required=None, public_methods=None):
                 user_role_id = decoded_data.get("user_role_id")
 
                 if user_id is None or user_role_id is None:
+                    if is_public:
+                        return _serve_anonymously("invalid")
+
                     return JsonResponse(
                         {
                             "success": False,
@@ -74,6 +96,9 @@ def user_authentication_required(role_required=None, public_methods=None):
                 request.jwt_payload = decoded_data
 
             except ValueError as e:
+                if is_public:
+                    return _serve_anonymously("invalid")
+
                 return JsonResponse(
                     {
                         "success": False,
@@ -84,6 +109,9 @@ def user_authentication_required(role_required=None, public_methods=None):
                 )
 
             except jwt.ExpiredSignatureError:
+                if is_public:
+                    return _serve_anonymously("expired")
+
                 return JsonResponse(
                     {
                         "success": False,
@@ -94,6 +122,9 @@ def user_authentication_required(role_required=None, public_methods=None):
                 )
 
             except jwt.InvalidTokenError as e:
+                if is_public:
+                    return _serve_anonymously("invalid")
+
                 return JsonResponse(
                     {
                         "success": False,

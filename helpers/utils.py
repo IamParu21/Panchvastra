@@ -10,7 +10,7 @@ from botocore.config import Config as BotoConfig
 import jwt
 import os
 import requests
-from panchvastra.settings import BREVO_API_KEY, RUSTFS_ACCESS_KEY, RUSTFS_BUCKET_NAME, RUSTFS_ENDPOINT_URL, RUSTFS_PUBLIC_URL_BASE, RUSTFS_REGION, RUSTFS_SECRET_KEY, SECRET_KEY
+from panchvastra.settings import BREVO_API_KEY, RUSTFS_ACCESS_KEY, RUSTFS_BUCKET_NAME, RUSTFS_ENDPOINT_URL, RUSTFS_PRESIGN_ENDPOINT_URL, RUSTFS_PUBLIC_URL_BASE, RUSTFS_REGION, RUSTFS_SECRET_KEY, SECRET_KEY
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connection, DataError, IntegrityError
 from rest_framework.response import Response
@@ -527,6 +527,94 @@ def validate_image_files(files):
             raise ValidationError({"images": e.messages})
 
     return validated
+
+
+# Product videos are uploaded by the admin browser straight to RustFS with a
+# presigned PUT URL, never through this app — a large file streamed through
+# Django would hold a worker (and, for product saves, a DB transaction) for
+# the whole upload and hit proxy/request timeouts.
+VIDEO_CONTENT_TYPES = {
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov",
+}
+MAX_VIDEO_UPLOAD_BYTES = 50 * 1024 * 1024
+VIDEO_UPLOAD_PREFIX = "products/videos/"
+VIDEO_UPLOAD_URL_EXPIRES_SECONDS = 15 * 60
+
+_s3_presign_client = None
+
+
+def _get_s3_presign_client():
+    """Client used only to SIGN upload URLs for browsers. A SigV4 URL is
+    bound to the host it was signed for, so it must be the public S3 API
+    address of RustFS — RUSTFS_ENDPOINT_URL may be an internal Docker/Coolify
+    address a browser can't reach. Signing is offline; this client never
+    makes a network call itself."""
+    global _s3_presign_client
+
+    if _s3_presign_client is None:
+        _s3_presign_client = boto3.client(
+            "s3",
+            endpoint_url=RUSTFS_PRESIGN_ENDPOINT_URL or RUSTFS_ENDPOINT_URL,
+            aws_access_key_id=RUSTFS_ACCESS_KEY,
+            aws_secret_access_key=RUSTFS_SECRET_KEY,
+            region_name=RUSTFS_REGION,
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"}
+            ),
+        )
+
+    return _s3_presign_client
+
+
+def storage_public_url(object_key):
+    return f"{RUSTFS_PUBLIC_URL_BASE.rstrip('/')}/{object_key}"
+
+
+def create_video_upload_url(content_type):
+    """Presigned PUT for one new product video. The object key is generated
+    here (never taken from the client) under VIDEO_UPLOAD_PREFIX, and the
+    Content-Type is part of the signature, so the browser must send exactly
+    that header."""
+    object_key = f"{VIDEO_UPLOAD_PREFIX}{uuid.uuid4().hex}.{VIDEO_CONTENT_TYPES[content_type]}"
+
+    upload_url = _get_s3_presign_client().generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": RUSTFS_BUCKET_NAME,
+            "Key": object_key,
+            "ContentType": content_type
+        },
+        ExpiresIn=VIDEO_UPLOAD_URL_EXPIRES_SECONDS,
+        HttpMethod="PUT"
+    )
+
+    return {
+        "upload_url": upload_url,
+        "method": "PUT",
+        "headers": {"Content-Type": content_type},
+        "file_id": object_key,
+        "public_url": storage_public_url(object_key),
+        "expires_in": VIDEO_UPLOAD_URL_EXPIRES_SECONDS,
+        "max_bytes": MAX_VIDEO_UPLOAD_BYTES
+    }
+
+
+def get_storage_object_info(object_key):
+    """(size_in_bytes, content_type) of an uploaded object, or None if it
+    doesn't exist. Any other storage failure propagates."""
+    from botocore.exceptions import ClientError
+
+    try:
+        head = _get_s3_client().head_object(Bucket=RUSTFS_BUCKET_NAME, Key=object_key)
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+
+    return head["ContentLength"], (head.get("ContentType") or "").split(";")[0].strip().lower()
 
 
 # def replace_image(

@@ -10,7 +10,7 @@ from rest_framework import status
 from helpers.middleware import user_authentication_required
 from helpers.invoice import build_invoice_pdf
 from helpers.utils import generic_response_handler, validate_image_files
-from pv_app.api.business_logic.bl_user_panel import add_to_cart, create_address, create_auth_carousel_image, create_category, create_coupon, create_notify_me_request, create_order_note, create_product, create_sub_category, delete_address, delete_auth_carousel_image, delete_cart_item, delete_category, delete_coupon, delete_notify_me_request, delete_order_note, delete_product, delete_sub_category, get_addresses, get_auth_carousel_images, get_cart, get_categories, get_coupons, get_notify_me_requests, get_order_detail, get_order_listing, get_product_detail, get_product_listing, get_sub_categories, update_address, update_auth_carousel_image, update_cart_quantity, update_category, update_coupon, update_order_address, update_order_status, update_product, update_sub_category
+from pv_app.api.business_logic.bl_user_panel import add_to_cart, create_address, create_auth_carousel_image, create_category, create_coupon, create_notify_me_request, create_order_note, create_product, create_sub_category, delete_address, delete_auth_carousel_image, delete_cart_item, delete_category, delete_coupon, delete_notify_me_request, delete_order_note, delete_product, delete_sub_category, get_addresses, get_auth_carousel_images, get_cart, get_categories, get_coupons, get_notify_me_requests, get_order_detail, get_order_listing, get_product_detail, get_product_detail_by_slug, get_product_listing, get_sub_categories, update_address, update_auth_carousel_image, update_cart_quantity, update_category, update_coupon, update_order_address, update_order_status, update_product, update_sub_category
 from pv_app.api.serializer.sz_user_panel import AddToCartSerializer, CouponSerializer, CreateAddressSerializer, CreateAuthCarouselImageSerializer, CreateCategorySerializer, CreateOrderNoteSerializer, CreateProductSerializer, CreateSubCategorySerializer, NotifyMeSerializer, UpdateAddressSerializer, UpdateAuthCarouselImageSerializer, UpdateCartSerializer, UpdateCategorySerializer, UpdateCouponSerializer, UpdateOrderAddressSerializer, UpdateOrderStatusSerializer, UpdateProductSerializer, UpdateSubCategorySerializer
 from pv_app.api.swagger.swag_user_panel import address_management_schema, auth_carousel_schema, categories_management_schema, products_management_schema, cart_management_schema, coupon_management_schema, notify_me_schema, order_address_schema, order_invoice_schema, order_notes_schema, orders_schema, sub_categories_management_schema
 
@@ -183,7 +183,8 @@ def categories_management(request):
             page,
             page_size,
             category_id,
-            search
+            search,
+            slug=request.GET.get("slug")
         )
 
     elif request.method == "PUT":
@@ -237,7 +238,9 @@ def sub_categories_management(request):
             page_size,
             sub_category_id,
             category_id,
-            search
+            search,
+            slug=request.GET.get("slug"),
+            category_slug=request.GET.get("category_slug")
         )
 
     elif request.method == "PUT":
@@ -346,6 +349,9 @@ def products_management(request):
                 product_id=product_id
             )
 
+        if request.GET.get("slug"):
+            return get_product_detail_by_slug(request.GET.get("slug"))
+
         return get_product_listing(
             page=request.GET.get("page", 1),
             page_size=request.GET.get("page_size", 20),
@@ -357,7 +363,8 @@ def products_management(request):
             min_price=request.GET.get("min_price"),
             max_price=request.GET.get("max_price"),
             search=request.GET.get("search"),
-            sort_by=request.GET.get("sort_by", "latest")
+            sort_by=request.GET.get("sort_by", "latest"),
+            related_to=request.GET.get("related_to")
         )
 
     elif request.method == "PUT":

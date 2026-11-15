@@ -4,6 +4,7 @@ from django.conf import settings
 from rest_framework.response import Response
 
 from .services.razorpay_client import client
+from pv_app.api.business_logic.bl_storefront import fetch_active_quantity_tiers, resolve_quantity_discount
 import json
 import hmac
 import hashlib
@@ -90,10 +91,66 @@ class _CheckoutAborted(Exception):
         self.status_code = status_code
 
 
+def _fetch_buy_now_row(cursor, variant_size_id, quantity):
+    """The single Buy Now line, in the same column order the Razorpay cart
+    query returns, so both checkout paths can treat it like a one-line cart."""
+    cursor.execute("""
+        SELECT
+            pvs.id, pvs.size, pvs.stock_quantity,
+            v.id, v.color, v.mrp, v.selling_price,
+            p.id, p.name,
+            %s
+        FROM public.product_variant_sizes pvs
+        JOIN public.product_variants v ON v.id = pvs.variant_id
+        JOIN public.products p ON p.id = v.product_id
+        WHERE pvs.id = %s
+        AND pvs.is_active = TRUE AND pvs.is_deleted = FALSE
+        AND v.is_active = TRUE AND v.is_deleted = FALSE
+        AND p.is_active = TRUE AND p.is_deleted = FALSE
+    """, [quantity, variant_size_id])
+
+    row = cursor.fetchone()
+
+    if not row:
+        raise _CheckoutAborted({"message": "The selected product is no longer available."}, 400)
+
+    return row
+
+
+def _apply_discounts(cursor, items, subtotal, coupon_code, user_id):
+    """Quantity tier first (automatic, on the whole order's item count),
+    then the coupon on what is left. Returns
+    (quantity_discount_amount, total_discount_amount, coupon_id)."""
+    item_count = sum(item["quantity"] for item in items)
+
+    quantity_discount_amount = resolve_quantity_discount(
+        fetch_active_quantity_tiers(cursor), item_count, subtotal
+    )["discount_amount"]
+
+    amount_after_tier = round(subtotal - quantity_discount_amount, 2)
+
+    coupon_id = None
+    coupon_discount = 0.0
+
+    if coupon_code:
+
+        coupon_result = _validate_coupon(cursor, coupon_code, user_id, amount_after_tier)
+
+        if "error" in coupon_result:
+            raise _CheckoutAborted({"message": coupon_result["error"]}, 400)
+
+        coupon_id = coupon_result["coupon_id"]
+        coupon_discount = coupon_result["discount_amount"]
+
+    return quantity_discount_amount, round(quantity_discount_amount + coupon_discount, 2), coupon_id
+
+
 def create_checkout_payment(validated_data, user_id):
 
     address_id = validated_data["address_id"]
     coupon_code = validated_data.get("coupon_code")
+    buy_now_size_id = validated_data.get("variant_size_id")
+    buy_now_quantity = validated_data.get("quantity") or 1
 
     # Step 1: everything that touches our own DB happens in one real
     # transaction, including a placeholder `payments` row — so the
@@ -149,29 +206,62 @@ def create_checkout_payment(validated_data, user_id):
                     pincode
                 ) = address_row
 
-                # 3. Cart items, priced from the DB (never trust client-supplied prices)
-                cursor.execute("""
-                    SELECT
-                        pvs.id AS variant_size_id,
-                        pvs.size,
-                        pvs.stock_quantity,
-                        v.id AS variant_id,
-                        v.color,
-                        v.mrp,
-                        v.selling_price,
-                        p.id AS product_id,
-                        p.name AS product_name,
-                        ci.quantity
-                    FROM public.cart_items ci
-                    JOIN public.product_variant_sizes pvs ON pvs.id = ci.variant_size_id
-                    JOIN public.product_variants v ON v.id = pvs.variant_id
-                    JOIN public.products p ON p.id = v.product_id
-                    WHERE ci.user_id = %s
-                    AND ci.is_deleted = FALSE
-                    AND ci.is_active = TRUE
-                """, [user_id])
+                # 3. Cart items (or the single Buy Now line), priced from the
+                # DB (never trust client-supplied prices)
+                if buy_now_size_id:
+                    cart_rows = [_fetch_buy_now_row(cursor, buy_now_size_id, buy_now_quantity)]
+                else:
+                    # LEFT JOINs + is_available, same rule as COD: a size,
+                    # variant or product removed/deactivated after it was
+                    # added to the cart must block the checkout, not be sold.
+                    cursor.execute("""
+                        SELECT
+                            pvs.id AS variant_size_id,
+                            pvs.size,
+                            pvs.stock_quantity,
+                            v.id AS variant_id,
+                            v.color,
+                            v.mrp,
+                            v.selling_price,
+                            p.id AS product_id,
+                            p.name AS product_name,
+                            ci.quantity,
+                            ci.id AS cart_item_id,
+                            COALESCE(
+                                pvs.is_active AND NOT pvs.is_deleted
+                                AND v.is_active AND NOT v.is_deleted
+                                AND p.is_active AND NOT p.is_deleted,
+                                FALSE
+                            ) AS is_available
+                        FROM public.cart_items ci
+                        LEFT JOIN public.product_variant_sizes pvs ON pvs.id = ci.variant_size_id
+                        LEFT JOIN public.product_variants v ON v.id = pvs.variant_id
+                        LEFT JOIN public.products p ON p.id = v.product_id
+                        WHERE ci.user_id = %s
+                        AND ci.is_deleted = FALSE
+                        AND ci.is_active = TRUE
+                    """, [user_id])
 
-                cart_rows = cursor.fetchall()
+                    fetched_rows = cursor.fetchall()
+
+                    unavailable_items = [
+                        {
+                            "cart_item_id": row[10],
+                            "product_name": row[8],
+                            "size": row[1],
+                            "color": row[4]
+                        }
+                        for row in fetched_rows
+                        if not row[11]
+                    ]
+
+                    if unavailable_items:
+                        raise _CheckoutAborted({
+                            "message": "Some items in your cart are no longer available. Please review your cart.",
+                            "data": {"unavailable_items": unavailable_items}
+                        }, 400)
+
+                    cart_rows = [row[:10] for row in fetched_rows]
 
                 if not cart_rows:
                     raise _CheckoutAborted({"message": "Your cart is empty."}, 400)
@@ -220,19 +310,11 @@ def create_checkout_payment(validated_data, user_id):
 
                 subtotal = round(subtotal, 2)
 
-                # 4. Coupon (optional)
-                coupon_id = None
-                discount_amount = 0.0
-
-                if coupon_code:
-
-                    coupon_result = _validate_coupon(cursor, coupon_code, user_id, subtotal)
-
-                    if "error" in coupon_result:
-                        raise _CheckoutAborted({"message": coupon_result["error"]}, 400)
-
-                    coupon_id = coupon_result["coupon_id"]
-                    discount_amount = coupon_result["discount_amount"]
+                # 4. Quantity tier (automatic) + coupon (optional).
+                # discount_amount is the total of both.
+                quantity_discount_amount, discount_amount, coupon_id = _apply_discounts(
+                    cursor, items, subtotal, coupon_code, user_id
+                )
 
                 grand_total = round(subtotal - discount_amount, 2)
 
@@ -243,13 +325,13 @@ def create_checkout_payment(validated_data, user_id):
                     INSERT INTO public.orders (
                         order_number, user_id, customer_name, customer_email, customer_mobile,
                         address_line_1, address_line_2, landmark, city, state, country, pincode,
-                        subtotal, discount_amount, shipping_amount, tax_amount, grand_total,
+                        subtotal, discount_amount, quantity_discount_amount, shipping_amount, tax_amount, grand_total,
                         coupon_id, payment_method, payment_status, order_status,
                         ordered_at, created_at, updated_at
                     )
                     VALUES (
                         %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                        %s,%s,0,0,%s,
+                        %s,%s,%s,0,0,%s,
                         %s,'RAZORPAY','PENDING','PLACED',
                         NOW(),NOW(),NOW()
                     )
@@ -257,7 +339,7 @@ def create_checkout_payment(validated_data, user_id):
                 """, [
                     order_number, user_id, customer_name, customer_email, customer_mobile,
                     address_line_1, address_line_2, landmark, city, state, country, pincode,
-                    subtotal, discount_amount, grand_total, coupon_id
+                    subtotal, discount_amount, quantity_discount_amount, grand_total, coupon_id
                 ])
 
                 order_id = cursor.fetchone()[0]
@@ -356,6 +438,8 @@ def create_cod_order(validated_data, user_id):
 
     address_id = validated_data["address_id"]
     coupon_code = validated_data.get("coupon_code")
+    buy_now_size_id = validated_data.get("variant_size_id")
+    buy_now_quantity = validated_data.get("quantity") or 1
 
     try:
         with transaction.atomic():
@@ -405,44 +489,65 @@ def create_cod_order(validated_data, user_id):
                     pincode
                 ) = address_row
 
-                # 3a. Cart items, priced from the DB. Plain read (no lock yet —
+                # 3a. Cart items (skipped for Buy Now), priced from the DB. Plain read (no lock yet —
                 # Postgres won't allow FOR UPDATE on the nullable side of these
                 # outer joins) just to work out which cart rows still resolve to
                 # a live, active size/variant/product.
-                cursor.execute("""
-                    SELECT
-                        ci.id AS cart_item_id,
-                        ci.quantity,
-                        pvs.id AS variant_size_id,
-                        pvs.size,
-                        pvs.is_active AS size_active,
-                        pvs.is_deleted AS size_deleted,
-                        v.id AS variant_id,
-                        v.color,
-                        v.mrp,
-                        v.selling_price,
-                        v.is_active AS variant_active,
-                        v.is_deleted AS variant_deleted,
-                        p.id AS product_id,
-                        p.name AS product_name,
-                        p.is_active AS product_active,
-                        p.is_deleted AS product_deleted
-                    FROM public.cart_items ci
-                    LEFT JOIN public.product_variant_sizes pvs ON pvs.id = ci.variant_size_id
-                    LEFT JOIN public.product_variants v ON v.id = pvs.variant_id
-                    LEFT JOIN public.products p ON p.id = v.product_id
-                    WHERE ci.user_id = %s
-                    AND ci.is_deleted = FALSE
-                    AND ci.is_active = TRUE
-                """, [user_id])
+                cart_rows = []
 
-                cart_rows = cursor.fetchall()
+                if not buy_now_size_id:
+                    cursor.execute("""
+                        SELECT
+                            ci.id AS cart_item_id,
+                            ci.quantity,
+                            pvs.id AS variant_size_id,
+                            pvs.size,
+                            pvs.is_active AS size_active,
+                            pvs.is_deleted AS size_deleted,
+                            v.id AS variant_id,
+                            v.color,
+                            v.mrp,
+                            v.selling_price,
+                            v.is_active AS variant_active,
+                            v.is_deleted AS variant_deleted,
+                            p.id AS product_id,
+                            p.name AS product_name,
+                            p.is_active AS product_active,
+                            p.is_deleted AS product_deleted
+                        FROM public.cart_items ci
+                        LEFT JOIN public.product_variant_sizes pvs ON pvs.id = ci.variant_size_id
+                        LEFT JOIN public.product_variants v ON v.id = pvs.variant_id
+                        LEFT JOIN public.products p ON p.id = v.product_id
+                        WHERE ci.user_id = %s
+                        AND ci.is_deleted = FALSE
+                        AND ci.is_active = TRUE
+                    """, [user_id])
 
-                if not cart_rows:
-                    raise _CheckoutAborted({"message": "Your cart is empty."}, 400)
+                    cart_rows = cursor.fetchall()
+
+                    if not cart_rows:
+                        raise _CheckoutAborted({"message": "Your cart is empty."}, 400)
 
                 candidates = []
                 unavailable_items = []
+
+                if buy_now_size_id:
+                    (
+                        variant_size_id, size, _, variant_id, color,
+                        mrp, selling_price, product_id, product_name, quantity
+                    ) = _fetch_buy_now_row(cursor, buy_now_size_id, buy_now_quantity)
+
+                    candidates.append({
+                        "variant_size_id": variant_size_id,
+                        "product_id": product_id,
+                        "variant_id": variant_id,
+                        "product_name": product_name,
+                        "size": size,
+                        "color": color,
+                        "quantity": quantity,
+                        "mrp": float(mrp),
+                        "selling_price": float(selling_price)
+                    })
 
                 for (
                     cart_item_id, quantity, variant_size_id, size,
@@ -529,19 +634,11 @@ def create_cod_order(validated_data, user_id):
 
                 subtotal = round(subtotal, 2)
 
-                # 4. Coupon (optional)
-                coupon_id = None
-                discount_amount = 0.0
-
-                if coupon_code:
-
-                    coupon_result = _validate_coupon(cursor, coupon_code, user_id, subtotal)
-
-                    if "error" in coupon_result:
-                        raise _CheckoutAborted({"message": coupon_result["error"]}, 400)
-
-                    coupon_id = coupon_result["coupon_id"]
-                    discount_amount = coupon_result["discount_amount"]
+                # 4. Quantity tier (automatic) + coupon (optional).
+                # discount_amount is the total of both.
+                quantity_discount_amount, discount_amount, coupon_id = _apply_discounts(
+                    cursor, items, subtotal, coupon_code, user_id
+                )
 
                 grand_total = round(subtotal - discount_amount, 2)
 
@@ -554,13 +651,13 @@ def create_cod_order(validated_data, user_id):
                     INSERT INTO public.orders (
                         order_number, user_id, customer_name, customer_email, customer_mobile,
                         address_line_1, address_line_2, landmark, city, state, country, pincode,
-                        subtotal, discount_amount, shipping_amount, tax_amount, grand_total,
+                        subtotal, discount_amount, quantity_discount_amount, shipping_amount, tax_amount, grand_total,
                         coupon_id, payment_method, payment_status, order_status,
                         ordered_at, created_at, updated_at
                     )
                     VALUES (
                         %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                        %s,%s,0,0,%s,
+                        %s,%s,%s,0,0,%s,
                         %s,'COD','PENDING','PLACED',
                         NOW(),NOW(),NOW()
                     )
@@ -568,7 +665,7 @@ def create_cod_order(validated_data, user_id):
                 """, [
                     order_number, user_id, customer_name, customer_email, customer_mobile,
                     address_line_1, address_line_2, landmark, city, state, country, pincode,
-                    subtotal, discount_amount, grand_total, coupon_id
+                    subtotal, discount_amount, quantity_discount_amount, grand_total, coupon_id
                 ])
 
                 order_id = cursor.fetchone()[0]
@@ -651,6 +748,7 @@ def create_cod_order(validated_data, user_id):
             "order_status": "PLACED",
             "subtotal": subtotal,
             "discount_amount": discount_amount,
+            "quantity_discount_amount": quantity_discount_amount,
             "grand_total": grand_total
         }
     }, 201

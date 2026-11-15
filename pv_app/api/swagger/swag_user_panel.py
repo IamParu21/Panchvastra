@@ -94,6 +94,16 @@ categories_management_schema = extend_schema_view(
                 required=False
             ),
             OpenApiParameter(
+                name="slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "Category page by URL slug, e.g. t-shirts. Old slugs still resolve; "
+                    "data.slug is the current one, so redirect (301) when it differs."
+                )
+            ),
+            OpenApiParameter(
                 name="search_parameter",
                 type=OpenApiTypes.STR,
                 location=OpenApiParameter.QUERY,
@@ -167,6 +177,23 @@ sub_categories_management_schema = extend_schema_view(
                 type=OpenApiTypes.INT,
                 location=OpenApiParameter.QUERY,
                 required=False
+            ),
+            OpenApiParameter(
+                name="slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "Sub-category page by URL, e.g. /t-shirts/embroidery -> category_slug=t-shirts&slug=embroidery. "
+                    "Old slugs of either part still resolve; data.slug and data.category_slug are the current ones."
+                )
+            ),
+            OpenApiParameter(
+                name="category_slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Required together with slug."
             ),
             OpenApiParameter(
                 name="category_id",
@@ -254,6 +281,17 @@ products_management_schema = extend_schema_view(
                 description="Fetch a specific product by ID"
             ),
             OpenApiParameter(
+                name="slug",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "Product page by URL slug, e.g. bamboo-piece (/products/bamboo-piece). Old slugs still "
+                    "resolve; data.slug is the current one, so redirect (301) when it differs. Every listing "
+                    "card also carries slug for building links."
+                )
+            ),
+            OpenApiParameter(
                 name="category_id",
                 type=OpenApiTypes.INT,
                 location=OpenApiParameter.QUERY,
@@ -309,6 +347,17 @@ products_management_schema = extend_schema_view(
                 - display_order (the admin-curated order; products with no
                   position set come last, newest first)
                 """
+            ),
+            OpenApiParameter(
+                name="related_to",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description=(
+                    "'You May Also Like': products in the same category as this "
+                    "product id (itself excluded), same sub-category first, then "
+                    "sort_by. Combine with page_size (e.g. 8)."
+                )
             ),
             OpenApiParameter(
                 name="tag",

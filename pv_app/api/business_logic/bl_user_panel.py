@@ -6,6 +6,8 @@ from datetime import datetime, timezone as dt_timezone
 from django.db import connection
 from rest_framework import status
 from django.db import transaction
+from pv_app.api.business_logic.bl_storefront import fetch_active_quantity_tiers, resolve_quantity_discount
+from helpers.slugs import CATEGORY, PRODUCT, SUB_CATEGORY, SlugConflict, find_id_by_slug, generate_unique_slug, is_slug_taken, normalize_requested_slug, record_slug_change, resolve_requested_slug
 from helpers.utils import clamp_page, clamp_page_size, db_query_result_to_json, delete_image_from_storage, resolve_pagination, send_restock_notification_email, upload_image_to_storage
 
 def create_category(data, user_id):
@@ -33,6 +35,11 @@ def create_category(data, user_id):
                 "message": "Category already exists.",
                 "data": {}
             }, status.HTTP_400_BAD_REQUEST
+
+        try:
+            slug = resolve_requested_slug(cursor, CATEGORY, data.get("slug"), name)
+        except SlugConflict as e:
+            return e.payload, e.status_code
 
         # Omitted display_order means "put it last", so the admin only has
         # to set positions when they actually care about them.
@@ -68,6 +75,7 @@ def create_category(data, user_id):
                 INSERT INTO categories
                 (
                     name,
+                    slug,
                     description,
                     image_url,
                     imagekit_file_id,
@@ -88,6 +96,7 @@ def create_category(data, user_id):
                     %s,
                     %s,
                     %s,
+                    %s,
                     NOW(),
                     NOW()
                 )
@@ -95,6 +104,7 @@ def create_category(data, user_id):
                 """,
                 [
                     name,
+                    slug,
                     description,
                     image_url,
                     imagekit_file_id,
@@ -124,12 +134,26 @@ def get_categories(
     page=1,
     page_size=10,
     category_id=None,
-    search=None
+    search=None,
+    slug=None
 ):
+
+    # Lookup by URL slug (current or old). The response carries the current
+    # slug, so the frontend can 301 an old URL to it.
+    if slug and not category_id:
+        with connection.cursor() as cursor:
+            category_id = find_id_by_slug(cursor, CATEGORY, slug)
+
+        if not category_id:
+            return {
+                "message": "Category not found.",
+                "data": {}
+            }, status.HTTP_404_NOT_FOUND
 
     select_columns = [
         "id",
         "name",
+        "slug",
         "description",
         "image_url",
         "is_active",
@@ -227,7 +251,7 @@ def update_category(data, user_id):
 
         cursor.execute(
             """
-            SELECT imagekit_file_id
+            SELECT imagekit_file_id, slug
             FROM categories
             WHERE id = %s
             AND is_deleted = FALSE
@@ -243,7 +267,17 @@ def update_category(data, user_id):
                 "data": {}
             }, status.HTTP_404_NOT_FOUND
 
-        old_file_id = row[0]
+        old_file_id, current_slug = row
+
+        # The slug only changes when the admin sends a different one; a
+        # rename keeps the URL.
+        new_slug = current_slug
+
+        if data.get("slug"):
+            new_slug = normalize_requested_slug(data["slug"])
+
+            if new_slug != current_slug and is_slug_taken(cursor, CATEGORY, new_slug, 0, category_id):
+                return SlugConflict(CATEGORY, new_slug).payload, status.HTTP_409_CONFLICT
 
     for field in updatable_fields:
 
@@ -275,6 +309,10 @@ def update_category(data, user_id):
 
             set_parts.append(f"{field} = %s")
             values.append(data[field])
+
+    if new_slug != current_slug:
+        set_parts.append("slug = %s")
+        values.append(new_slug)
 
     # Upload the replacement image (if any) before touching the DB, but don't
     # delete the old one yet — if the DB update below fails, the old image
@@ -323,6 +361,8 @@ def update_category(data, user_id):
                     "message": "Category not found.",
                     "data": {}
                 }, status.HTTP_404_NOT_FOUND
+
+            record_slug_change(cursor, CATEGORY, category_id, current_slug, 0, new_slug, 0)
 
     # Only delete the old image once the new one is confirmed committed.
     if new_upload and old_file_id:
@@ -766,6 +806,11 @@ def create_sub_category(data):
                 "data": {}
             }, status.HTTP_400_BAD_REQUEST
 
+        try:
+            slug = resolve_requested_slug(cursor, SUB_CATEGORY, data.get("slug"), name, scope_id=category_id)
+        except SlugConflict as e:
+            return e.payload, e.status_code
+
         # Ordering is scoped to the parent category — position 1 under "Men"
         # is unrelated to position 1 under "Women" — so "put it last" means
         # last within THIS category.
@@ -787,11 +832,13 @@ def create_sub_category(data):
             (
                 category_id,
                 name,
+                slug,
                 is_active,
                 display_order
             )
             VALUES
             (
+                %s,
                 %s,
                 %s,
                 %s,
@@ -802,6 +849,7 @@ def create_sub_category(data):
             [
                 category_id,
                 name,
+                slug,
                 is_active,
                 display_order
             ]
@@ -827,18 +875,44 @@ def get_sub_categories(
     page_size=10,
     sub_category_id=None,
     category_id=None,
-    search=None
+    search=None,
+    slug=None,
+    category_slug=None
 ):
+
+    # Lookup by URL (/<category_slug>/<slug>), current or old slugs of
+    # either part. The response carries both current slugs.
+    if slug and not sub_category_id:
+        if not category_slug:
+            return {
+                "message": "category_slug is required with slug.",
+                "data": {}
+            }, status.HTTP_400_BAD_REQUEST
+
+        with connection.cursor() as cursor:
+            parent_id = find_id_by_slug(cursor, CATEGORY, category_slug)
+            sub_category_id = find_id_by_slug(cursor, SUB_CATEGORY, slug, scope_id=parent_id) if parent_id else None
+
+        if not sub_category_id:
+            return {
+                "message": "Sub category not found.",
+                "data": {}
+            }, status.HTTP_404_NOT_FOUND
 
     select_columns = [
         "id",
         "category_id",
         "name",
+        "slug",
+        "category_slug",
         "is_active",
         "display_order"
     ]
 
-    columns_str = ", ".join(select_columns)
+    columns_str = ", ".join(select_columns).replace(
+        "category_slug",
+        "(SELECT c.slug FROM categories c WHERE c.id = sub_categories.category_id) AS category_slug"
+    )
 
     params = []
 
@@ -924,7 +998,7 @@ def update_sub_category(data):
 
         cursor.execute(
             """
-            SELECT category_id
+            SELECT category_id, slug, name
             FROM sub_categories
             WHERE id = %s
             AND is_deleted = FALSE
@@ -940,7 +1014,7 @@ def update_sub_category(data):
                 "data": {}
             }, status.HTTP_404_NOT_FOUND
 
-        current_category_id = row[0]
+        current_category_id, current_slug, current_name = row
 
     target_category_id = data.get("category_id", current_category_id)
 
@@ -965,8 +1039,34 @@ def update_sub_category(data):
                     "data": {}
                 }, status.HTTP_404_NOT_FOUND
 
+    # Slug: changes only when the admin sends a different one, or when the
+    # sub-category moves to a category where its slug is already used (then
+    # a free one is generated). The old URL keeps working via a redirect.
+    new_slug = current_slug
+
+    with connection.cursor() as cursor:
+
+        if data.get("slug"):
+            new_slug = normalize_requested_slug(data["slug"])
+
+            if (new_slug, target_category_id) != (current_slug, current_category_id) and is_slug_taken(
+                cursor, SUB_CATEGORY, new_slug, target_category_id, sub_category_id
+            ):
+                return SlugConflict(SUB_CATEGORY, new_slug).payload, status.HTTP_409_CONFLICT
+
+        elif target_category_id != current_category_id and is_slug_taken(
+            cursor, SUB_CATEGORY, current_slug, target_category_id, sub_category_id
+        ):
+            new_slug = generate_unique_slug(
+                cursor, SUB_CATEGORY, data.get("name", current_name), target_category_id, sub_category_id
+            )
+
     set_parts = []
     values = []
+
+    if new_slug != current_slug:
+        set_parts.append("slug = %s")
+        values.append(new_slug)
 
     for field in updatable_fields:
 
@@ -1016,7 +1116,7 @@ def update_sub_category(data):
         AND is_deleted = FALSE
     """
 
-    with connection.cursor() as cursor:
+    with transaction.atomic(), connection.cursor() as cursor:
 
         cursor.execute(sql, values)
 
@@ -1025,6 +1125,11 @@ def update_sub_category(data):
                 "message": "Sub category not found.",
                 "data": {}
             }, status.HTTP_404_NOT_FOUND
+
+        record_slug_change(
+            cursor, SUB_CATEGORY, sub_category_id,
+            current_slug, current_category_id, new_slug, target_category_id
+        )
 
     sub_category_data, _ = get_sub_categories(
         page=1,
@@ -1431,7 +1536,8 @@ def get_product_listing(
     min_price=None,
     max_price=None,
     search=None,
-    sort_by="latest"
+    sort_by="latest",
+    related_to=None
 ):
     page = clamp_page(page)
     page_size = clamp_page_size(page_size, default=20)
@@ -1510,6 +1616,19 @@ def get_product_listing(
         search_term = f"%{search}%"
         params.extend([search_term, search_term, search_term, search_term])
 
+    # "You May Also Like": same category as the given product, excluding it,
+    # same sub-category first. The subselects run once (InitPlan), not per row.
+    order_prefix = ""
+    order_params = []
+
+    if related_to:
+        where_conditions.append(
+            "p.id <> %s AND p.category_id = (SELECT category_id FROM public.products WHERE id = %s)"
+        )
+        params.extend([related_to, related_to])
+        order_prefix = "(p.sub_category_id IS NOT DISTINCT FROM (SELECT sub_category_id FROM public.products WHERE id = %s)) DESC, "
+        order_params.append(related_to)
+
     where_clause = " AND ".join(where_conditions)
 
     sort_mapping = {
@@ -1522,7 +1641,7 @@ def get_product_listing(
         # instead of jumping to the front.
         "display_order": "p.display_order ASC NULLS LAST, p.created_at DESC"
     }
-    order_by = sort_mapping.get(sort_by, "p.created_at DESC")
+    order_by = order_prefix + sort_mapping.get(sort_by, "p.created_at DESC")
 
     # The true cheapest-variant price only matters for price-based sorting —
     # for latest/oldest (the common case) this correlated subquery would run
@@ -1544,7 +1663,7 @@ def get_product_listing(
 
     main_sql = f"""
         SELECT 
-            p.id, p.name, p.description, p.fabric, p.gsm, p.is_featured, p.is_new_arrival, p.created_at,
+            p.id, p.name, p.slug, p.description, p.fabric, p.gsm, p.is_featured, p.is_new_arrival, p.created_at,
             c.id AS category_id, c.name AS category_name,
             sc.id AS sub_category_id, sc.name AS sub_category_name,
             
@@ -1563,7 +1682,7 @@ def get_product_listing(
             -- Primary Image for thumbnail
             (
                 SELECT image_url FROM public.product_variant_images img
-                WHERE img.variant_id = v.id AND img.is_deleted = FALSE AND img.is_active = TRUE
+                WHERE img.variant_id = v.id AND img.is_deleted = FALSE AND img.is_active = TRUE AND img.media_type = 'IMAGE'
                 ORDER BY img.display_order ASC LIMIT 1
             ) AS primary_image{min_price_select}
 
@@ -1583,7 +1702,7 @@ def get_product_listing(
         LIMIT %s OFFSET %s
     """
 
-    query_params = params + [page_size, offset]
+    query_params = params + order_params + [page_size, offset]
 
     with connection.cursor() as cursor:
         cursor.execute(main_sql, query_params)
@@ -1674,13 +1793,17 @@ def normalize_key_highlights(raw):
     return []
 
 
+# Display order of size buttons; anything not listed goes last, alphabetically.
+SIZE_SORT_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "XXL", "2XL", "XXXL", "3XL", "4XL", "5XL"]
+
+
 def get_product_detail(product_id):
 
     sql = """
         SELECT 
-            p.id, p.name, p.description, p.fabric, p.gsm, p.is_featured, p.is_new_arrival, p.created_at, p.key_highlights, p.display_order,
-            c.id AS category_id, c.name AS category_name,
-            sc.id AS sub_category_id, sc.name AS sub_category_name,
+            p.id, p.name, p.slug, p.description, p.fabric, p.gsm, p.is_featured, p.is_new_arrival, p.created_at, p.key_highlights, p.display_order,
+            c.id AS category_id, c.name AS category_name, c.slug AS category_slug,
+            sc.id AS sub_category_id, sc.name AS sub_category_name, sc.slug AS sub_category_slug,
             
             -- Structural Meta JSON build for product variants hierarchy
             (
@@ -1697,6 +1820,7 @@ def get_product_detail(product_id):
                         SELECT COALESCE(json_agg(json_build_object(
                             'id', img.id,
                             'image_url', img.image_url,
+                            'media_type', img.media_type,
                             'display_order', img.display_order
                         ) ORDER BY img.display_order ASC), '[]')
                         FROM public.product_variant_images img 
@@ -1708,7 +1832,7 @@ def get_product_detail(product_id):
                             'size', sz.size,
                             'stock_quantity', sz.stock_quantity,
                             'in_stock', (sz.stock_quantity > 0)
-                        )), '[]')
+                        ) ORDER BY COALESCE(array_position(%s::text[], UPPER(sz.size)), 1000), sz.size), '[]')
                         FROM public.product_variant_sizes sz
                         WHERE sz.variant_id = v.id AND sz.is_deleted = FALSE AND sz.is_active = TRUE
                     )
@@ -1723,7 +1847,56 @@ def get_product_detail(product_id):
                 FROM public.product_tag_mapping m
                 JOIN public.product_tags t ON t.id = m.tag_id
                 WHERE m.product_id = p.id AND m.is_deleted = FALSE AND m.is_active = TRUE
-            ) AS tags
+            ) AS tags,
+
+            -- Stars, review count and recommend percentage under the title
+            (
+                SELECT json_build_object(
+                    'average_rating', COALESCE(ROUND(AVG(r.rating)::numeric, 1), 0),
+                    'total_reviews', COUNT(*),
+                    'recommend_percentage', COALESCE(ROUND(100.0 * COUNT(*) FILTER (WHERE r.is_recommended) / NULLIF(COUNT(*), 0)), 0)
+                )
+                FROM public.product_reviews r
+                WHERE r.product_id = p.id AND r.is_active = TRUE AND r.is_deleted = FALSE
+            ) AS rating_summary,
+
+            -- "N people bought this in the last 30 days": distinct buyers of
+            -- confirmed orders (COD, or online with a successful payment)
+            (
+                SELECT COUNT(DISTINCT o.user_id)
+                FROM public.order_items oi
+                JOIN public.orders o ON o.id = oi.order_id
+                WHERE oi.product_id = p.id
+                AND oi.is_deleted = FALSE
+                AND o.is_deleted = FALSE
+                AND o.ordered_at >= NOW() - INTERVAL '30 days'
+                AND o.order_status <> 'CANCELLED'
+                AND (o.payment_method = 'COD' OR o.payment_status = 'SUCCESS')
+            ) AS recent_purchase_count,
+
+            -- Size guide of the product's category
+            (
+                SELECT json_build_object(
+                    'id', sch.id,
+                    'unit', sch.unit,
+                    'headers', sch.chart_headers,
+                    'rows', sch.chart_rows,
+                    'notes', sch.notes
+                )
+                FROM public.size_charts sch
+                WHERE sch.category_id = p.category_id AND sch.is_active = TRUE AND sch.is_deleted = FALSE
+                LIMIT 1
+            ) AS size_chart,
+
+            -- "More you shop, more you save" box
+            (
+                SELECT COALESCE(json_agg(json_build_object(
+                    'min_quantity', t.min_quantity,
+                    'discount_percentage', t.discount_percentage
+                ) ORDER BY t.min_quantity), '[]')
+                FROM public.quantity_discount_tiers t
+                WHERE t.is_active = TRUE AND t.is_deleted = FALSE
+            ) AS quantity_discount_tiers
 
         FROM public.products p
         INNER JOIN public.categories c ON c.id = p.category_id AND c.is_deleted = FALSE
@@ -1732,7 +1905,7 @@ def get_product_detail(product_id):
     """
 
     with connection.cursor() as cursor:
-        cursor.execute(sql, [product_id])
+        cursor.execute(sql, [SIZE_SORT_ORDER, product_id])
         row = cursor.fetchone()
         if not row:
             return {"message": "Product not found.", "data": {}}, status.HTTP_404_NOT_FOUND
@@ -1740,11 +1913,16 @@ def get_product_detail(product_id):
         columns = [col[0] for col in cursor.description]
         item = dict(zip(columns, row))
 
-    item["category"] = {"id": item.pop("category_id"), "name": item.pop("category_name")}
-    item["sub_category"] = {"id": item.pop("sub_category_id"), "name": item.pop("sub_category_name")} if item["sub_category_id"] else None
+    item["category"] = {"id": item.pop("category_id"), "name": item.pop("category_name"), "slug": item.pop("category_slug")}
+    sub_category_slug = item.pop("sub_category_slug")
+    item["sub_category"] = {"id": item.pop("sub_category_id"), "name": item.pop("sub_category_name"), "slug": sub_category_slug} if item["sub_category_id"] else None
     item["variants"] = json.loads(item["variants"]) if isinstance(item["variants"], str) else item["variants"]
     item["tags"] = json.loads(item["tags"]) if isinstance(item["tags"], str) else item["tags"]
     item["key_highlights"] = normalize_key_highlights(item.get("key_highlights"))
+
+    for key in ("rating_summary", "size_chart", "quantity_discount_tiers"):
+        if isinstance(item[key], str):
+            item[key] = json.loads(item[key])
 
     for v in item["variants"]:
         mrp = float(v["mrp"])
@@ -1756,6 +1934,18 @@ def get_product_detail(product_id):
 
     return {"message": "Data fetched successfully.", "data": item}, status.HTTP_200_OK
 
+
+
+def get_product_detail_by_slug(slug):
+    """Product page by URL slug, current or old. data.slug is the current
+    one: when it differs from the requested slug the frontend should 301."""
+    with connection.cursor() as cursor:
+        product_id = find_id_by_slug(cursor, PRODUCT, slug)
+
+    if not product_id:
+        return {"message": "Product not found.", "data": {}}, status.HTTP_404_NOT_FOUND
+
+    return get_product_detail(product_id)
 
 
 def add_to_cart(validated_data, user_id):
@@ -1823,6 +2013,7 @@ def get_cart(user_id):
             ci.quantity,
             p.id AS product_id,
             p.name AS product_name,
+            p.slug AS product_slug,
             v.color,
             pvs.size,
             v.mrp,
@@ -1832,7 +2023,7 @@ def get_cart(user_id):
             (pvs.stock_quantity > 0 AND pvs.is_active = TRUE) AS is_in_stock,
             (
                 SELECT image_url FROM public.product_variant_images img 
-                WHERE img.variant_id = v.id AND img.is_deleted = FALSE AND img.is_active = TRUE
+                WHERE img.variant_id = v.id AND img.is_deleted = FALSE AND img.is_active = TRUE AND img.media_type = 'IMAGE'
                 ORDER BY img.display_order ASC LIMIT 1
             ) AS primary_image
         FROM public.cart_items ci
@@ -1847,6 +2038,8 @@ def get_cart(user_id):
         cursor.execute(sql, [user_id])
         rows = cursor.fetchall()
         columns = [col[0] for col in cursor.description]
+
+        quantity_tiers = fetch_active_quantity_tiers(cursor) if rows else []
 
     cart_items = []
     total_mrp = 0.0
@@ -1865,13 +2058,24 @@ def get_cart(user_id):
 
         cart_items.append(item)
 
+    item_count = sum(i["quantity"] for i in cart_items if i["is_in_stock"])
+    subtotal = round(total_selling_price, 2)
+
+    # Same rule checkout/COD apply, so the cart shows what will be charged
+    # (before any coupon).
+    quantity_discount = resolve_quantity_discount(quantity_tiers, item_count, subtotal)
+
     cart_summary = {
         "items": cart_items,
         "summary": {
             "total_mrp": round(total_mrp, 2),
             "total_discount": round(total_mrp - total_selling_price, 2),
-            "subtotal": round(total_selling_price, 2),
-            "item_count": sum(i["quantity"] for i in cart_items if i["is_in_stock"])
+            "subtotal": subtotal,
+            "item_count": item_count,
+            "quantity_discount_amount": quantity_discount["discount_amount"],
+            "applied_quantity_tier": quantity_discount["applied_tier"],
+            "next_quantity_tier": quantity_discount["next_tier"],
+            "amount_payable": round(subtotal - quantity_discount["discount_amount"], 2)
         }
     }
 
@@ -2422,6 +2626,8 @@ def get_order_listing(
 
                             'product_id', oi.product_id,
 
+                            'product_slug', (SELECT ps.slug FROM public.products ps WHERE ps.id = oi.product_id),
+
                             'variant_id', oi.variant_id,
 
                             'product_name', oi.product_name,
@@ -2448,6 +2654,7 @@ def get_order_listing(
                                     pvi.variant_id = pv.id
                                     AND pvi.is_deleted = FALSE
                                     AND pvi.is_active = TRUE
+                                    AND pvi.media_type = 'IMAGE'
                                 ORDER BY pvi.display_order
                                 LIMIT 1
                             )
@@ -2577,6 +2784,7 @@ def get_order_detail(order_id, user_id=None):
 
             o.subtotal,
             o.discount_amount,
+            o.quantity_discount_amount,
             o.shipping_amount,
             o.tax_amount,
             o.grand_total,
@@ -2649,6 +2857,8 @@ def get_order_detail(order_id, user_id=None):
             oi.product_id,
             oi.variant_id,
 
+            (SELECT ps.slug FROM public.products ps WHERE ps.id = oi.product_id) AS product_slug,
+
             oi.product_name,
 
             oi.color,
@@ -2669,14 +2879,22 @@ def get_order_detail(order_id, user_id=None):
                     pvi.variant_id = pv.id
                     AND pvi.is_deleted = FALSE
                     AND pvi.is_active = TRUE
+                    AND pvi.media_type = 'IMAGE'
                 ORDER BY pvi.display_order
                 LIMIT 1
-            ) AS image_url
+            ) AS image_url,
+
+            -- NULL = not reviewed yet (reviewable once the order is DELIVERED)
+            pr.id AS review_id
 
         FROM public.order_items oi
 
         INNER JOIN public.product_variants pv
             ON pv.id = oi.variant_id
+
+        LEFT JOIN public.product_reviews pr
+            ON pr.order_item_id = oi.id
+            AND pr.is_deleted = FALSE
 
         WHERE
             oi.order_id = %s
@@ -2708,6 +2926,7 @@ def get_order_detail(order_id, user_id=None):
 
     order["subtotal"] = float(order["subtotal"] or 0)
     order["discount_amount"] = float(order["discount_amount"] or 0)
+    order["quantity_discount_amount"] = float(order["quantity_discount_amount"] or 0)
     order["shipping_amount"] = float(order["shipping_amount"] or 0)
     order["tax_amount"] = float(order["tax_amount"] or 0)
     order["grand_total"] = float(order["grand_total"] or 0)
@@ -2858,7 +3077,11 @@ def get_order_detail(order_id, user_id=None):
 
             "subtotal": order["subtotal"],
 
+            # Total discount; quantity_discount_amount is the part of it
+            # that came from the quantity tier, the rest is the coupon.
             "discount_amount": order["discount_amount"],
+
+            "quantity_discount_amount": order["quantity_discount_amount"],
 
             "shipping_amount": order["shipping_amount"],
 
@@ -3469,6 +3692,11 @@ def create_product(data, user_id):
 
                 display_order = cursor.fetchone()[0] + 1
 
+            try:
+                slug = resolve_requested_slug(cursor, PRODUCT, data.get("slug"), name)
+            except SlugConflict as e:
+                return e.payload, e.status_code
+
             cursor.execute(
                 """
                 INSERT INTO products
@@ -3476,6 +3704,7 @@ def create_product(data, user_id):
                     category_id,
                     sub_category_id,
                     name,
+                    slug,
                     description,
                     fabric,
                     gsm,
@@ -3504,6 +3733,7 @@ def create_product(data, user_id):
                     %s,
                     %s,
                     %s,
+                    %s,
                     NOW(),
                     NOW()
                 )
@@ -3513,6 +3743,7 @@ def create_product(data, user_id):
                     category_id,
                     sub_category_id,
                     name,
+                    slug,
                     description,
                     fabric,
                     gsm,
@@ -4164,7 +4395,7 @@ def update_product(data, user_id):
 
             cursor.execute(
                 """
-                SELECT 1
+                SELECT slug
                 FROM products
                 WHERE id=%s
                 AND is_deleted=FALSE
@@ -4172,11 +4403,26 @@ def update_product(data, user_id):
                 [product_id]
             )
 
-            if not cursor.fetchone():
+            slug_row = cursor.fetchone()
+
+            if not slug_row:
                 raise _ProductUpdateAborted({
                     "message": "Product not found.",
                     "data": {}
                 }, status.HTTP_404_NOT_FOUND)
+
+            # The URL slug changes only when the admin sends a different one;
+            # renaming the product keeps the URL. The old slug is kept as a
+            # redirect below.
+            current_slug = slug_row[0]
+            new_slug = current_slug
+
+            if data.get("slug"):
+                new_slug = normalize_requested_slug(data["slug"])
+
+                if new_slug != current_slug and is_slug_taken(cursor, PRODUCT, new_slug, 0, product_id):
+                    conflict = SlugConflict(PRODUCT, new_slug)
+                    raise _ProductUpdateAborted(conflict.payload, conflict.status_code)
 
 
             cursor.execute(
@@ -4657,6 +4903,7 @@ def update_product(data, user_id):
                     category_id=%s,
                     sub_category_id=%s,
                     name=%s,
+                    slug=%s,
                     description=%s,
                     fabric=%s,
                     gsm=%s,
@@ -4674,6 +4921,7 @@ def update_product(data, user_id):
                     category_id,
                     sub_category_id,
                     name,
+                    new_slug,
                     description,
                     fabric,
                     gsm,
@@ -4686,6 +4934,8 @@ def update_product(data, user_id):
                     product_id
                 ]
             )
+
+            record_slug_change(cursor, PRODUCT, product_id, current_slug, 0, new_slug, 0)
 
             # --------------------------------------------------
             # Soft Delete Tags
